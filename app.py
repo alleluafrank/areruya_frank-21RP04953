@@ -1,5 +1,7 @@
-from flask import Flask, render_template, request, redirect, url_for, session,flash
+from flask import Flask, render_template, request, redirect, url_for, session, flash
 import mysql.connector
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
 
 app = Flask(__name__)
 app.secret_key = "your_secret_key"  # Change this to a secure random key in production
@@ -13,6 +15,15 @@ def get_db_connection():
         database='infocus_studio'
     )
 
+# Decorator for routes that require login
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
 # Register user route
 @app.route('/register', methods=['GET', 'POST'])
 def register():
@@ -22,16 +33,22 @@ def register():
         phone = request.form['phone']
         username = request.form['username']
         password = request.form['password']
+        hashed_password = generate_password_hash(password)
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('INSERT INTO users (Firstname, Lastname, phone, Username, Password) VALUES (%s, %s, %s, %s, %s)',
-                       (firstname, lastname, phone, username, password))
-        conn.commit()
-        cursor.close()
-        conn.close()
-        return redirect(url_for('login'))
-    return render_template('index.html')
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        'INSERT INTO users (Firstname, Lastname, phone, Username, Password) VALUES (%s, %s, %s, %s, %s)',
+                        (firstname, lastname, phone, username, hashed_password)
+                    )
+                    conn.commit()
+            flash('Registration successful!', 'success')
+            return redirect(url_for('login'))
+        except mysql.connector.Error as err:
+            flash(f"Error: {err}", 'danger')
+            return render_template('register.html')
+    return render_template('register.html')
 
 @app.route('/')
 def index():
@@ -44,42 +61,41 @@ def login():
         username = request.form['username']
         password = request.form['password']
 
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute('SELECT * FROM users WHERE Username = %s AND Password = %s', (username, password))
-        user = cursor.fetchone()
-        cursor.close()
-        conn.close()
-
-        if user:
-            session['user_id'] = user['user_id']
-            return redirect(url_for('dashboard'))
-        else:
-            return render_template('login.html', error='Invalid username or password')
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor(dictionary=True) as cursor:
+                    cursor.execute('SELECT * FROM users WHERE Username = %s', (username,))
+                    user = cursor.fetchone()
+            if user and check_password_hash(user['Password'], password):
+                session['user_id'] = user['user_id']
+                return redirect(url_for('dashboard'))
+            else:
+                flash('Invalid username or password', 'danger')
+        except mysql.connector.Error as err:
+            flash(f"Error: {err}", 'danger')
     return render_template('login.html')
 
 # Dashboard route
 @app.route('/dashboard')
+@login_required
 def dashboard():
-    if 'user_id' in session:
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute('SELECT * FROM users WHERE user_id = %s', (session['user_id'],))
-        user = cursor.fetchone()
-        cursor.close()
-        conn.close()
-
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(dictionary=True) as cursor:
+                cursor.execute('SELECT * FROM users WHERE user_id = %s', (session['user_id'],))
+                user = cursor.fetchone()
         if user:
             return render_template('dashboard.html', username=user['Username'])
+    except mysql.connector.Error as err:
+        flash(f"Error: {err}", 'danger')
     return redirect(url_for('login'))
 
 @app.route('/order_service', methods=['GET', 'POST'])
+@login_required
 def order_service():
-    # Fetch services from the database
     services = fetch_services_from_database()
 
     if request.method == 'POST':
-        # Retrieve form data
         firstName = request.form['firstName']
         lastName = request.form['lastName']
         phone = request.form['phone']
@@ -87,74 +103,63 @@ def order_service():
         service_price = request.form['service_price']
         date = request.form['date']
 
-        # Fetch user data from the database based on the session
         user = fetch_user_from_session()
-
         if user:
-            # Insert order into database
-            insert_order_into_database(firstName, lastName, phone, service_name, service_price, date)
-
-            # Redirect or render a thank you page
-            flash('Order sent successfully!', 'success')
-
-            return redirect(url_for('order_service'))
+            try:
+                insert_order_into_database(firstName, lastName, phone, service_name, service_price, date)
+                flash('Order sent successfully!', 'success')
+                return redirect(url_for('order_service'))
+            except mysql.connector.Error as err:
+                flash(f"Error: {err}", 'danger')
         else:
-            # Handle the case where the user session is invalid
             return redirect(url_for('login'))
 
-    # Fetch user data from the session
     user = fetch_user_from_session()
-
     return render_template('order_service.html', services=services, user=user)
 
 def fetch_user_from_session():
-    # Fetch user data from the session based on the user_id
     user_id = session.get('user_id')
     if user_id:
-        connection = get_db_connection()
-        cursor = connection.cursor(dictionary=True)
-        cursor.execute("SELECT Firstname, Lastname, phone FROM users WHERE user_id = %s", (user_id,))
-        user = cursor.fetchone()
-        cursor.close()
-        connection.close()
-        return user
-    else:
-        return None
-
+        try:
+            with get_db_connection() as connection:
+                with connection.cursor(dictionary=True) as cursor:
+                    cursor.execute("SELECT Firstname, Lastname, phone FROM users WHERE user_id = %s", (user_id,))
+                    return cursor.fetchone()
+        except mysql.connector.Error as err:
+            flash(f"Error: {err}", 'danger')
+    return None
 
 def fetch_services_from_database():
-    # Fetch services data from the database (replace this with your actual database query)
-    connection = get_db_connection()
-    cursor = connection.cursor(dictionary=True)
-    cursor.execute("SELECT service_id, service_name,price FROM services")
-    services = cursor.fetchall()
-    cursor.close()
-    connection.close()
-    return services
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor(dictionary=True) as cursor:
+                cursor.execute("SELECT service_id, service_name, price FROM services")
+                return cursor.fetchall()
+    except mysql.connector.Error as err:
+        flash(f"Error: {err}", 'danger')
+    return []
 
 def get_service_price_from_database(service_id):
-    # Fetch service price from the database (replace this with your actual database query)
-    connection = get_db_connection()
-    cursor = connection.cursor()
-    cursor.execute("SELECT price FROM services WHERE service_id = %s", (service_id,))
-    result = cursor.fetchone()
-    cursor.close()
-    connection.close()
-    if result:
-        return result[0]
-    else:
-        return None
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT price FROM services WHERE service_id = %s", (service_id,))
+                result = cursor.fetchone()
+                if result:
+                    return result[0]
+    except mysql.connector.Error as err:
+        flash(f"Error: {err}", 'danger')
+    return None
 
 def insert_order_into_database(firstName, lastName, phone, service_name, service_price, date):
-    # Insert order into the database (replace this with your actual database insert statement)
-    connection = get_db_connection()
-    cursor = connection.cursor()
-    cursor.execute("INSERT INTO orders (Firstname, Lastname, phone, service_name, price, date) VALUES (%s, %s, %s, %s, %s, %s)",
-                   (firstName, lastName, phone, service_name, service_price, date))
-    connection.commit()
-    cursor.close()
-    connection.close()
-
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("INSERT INTO orders (Firstname, Lastname, phone, service_name, price, date) VALUES (%s, %s, %s, %s, %s, %s)",
+                               (firstName, lastName, phone, service_name, service_price, date))
+                connection.commit()
+    except mysql.connector.Error as err:
+        flash(f"Error: {err}", 'danger')
 
 # Logout route
 @app.route('/logout')
